@@ -53,41 +53,7 @@ Evaluated across **10 dialogue-oriented LLMs** (0.8B to 9B parameters) against 2
 - **Optimiser Agnosticism**: Generalizes as a plug-in preconditioner across 5 distinct discrete optimizers (OPRO, GRIPS, TextGrad, EvoPrompt, DynamicRetrieval).
 - **Longitudinal Stability**: Sustains safe performance across a 10-week sequential adaptation schedule with **negligible catastrophic forgetting** ($< 0.01$ mean degradation) and high capability retention (**78.8% vs. 73.6%**).
 
----
 
-## 🚀 Quick Start
-
-### 1. Requirements & Setup
-```bash
-git clone https://github.com/your-username/SP2C-SafeCtrl.git
-cd SP2C-SafeCtrl
-pip install -r requirements.txt
-```
-
-### 2. Training Continuous Soft-Prompt Preconditioners (`Training Code/`)
-```bash
-cd "Training Code"
-python train_sp2c.py --model_name_or_path "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" --num_tokens 50 --epochs 5
-```
-
-### 3. Evaluating Gated Hybrid Inference (`Testing Code/`)
-```bash
-cd "../Testing Code"
-python run_inference.py --config sequential_hybrid --threshold 0.8 --max_budget 5
-```
-
----
-
-## 📜 Citation
-
-```bibtex
-@article{orme2026bootstrapping,
-  title={Bootstrapping Behavioural Control of LLM Dialogue via Soft-Prompt Preconditioning},
-  author={Orme, Michael and Yu, Yanchao and Tan, Zhiyuan},
-  journal={Engineering Applications of Artificial Intelligence (EAAI)},
-  year={2026}
-}
-```
 
 ---
 
