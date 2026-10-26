@@ -33,9 +33,7 @@ This repository implements a **hybrid safety framework** that cascades a Soft-Pr
 
 The framework operates via a **two-phase hybrid architecture**:
 
-![](4029a854-bbff-40b1-b8d7-6e5cf5577c90 (1).png)
-
-
+![](architecture.png)
 ```
 
 1. **Phase 1: Offline Soft Prompt Optimisation ($SP^2C$)**  
@@ -43,8 +41,12 @@ The framework operates via a **two-phase hybrid architecture**:
 2. **Phase 2: Gated Hybrid Inference Engine**  
    Each query is prepended with the soft prompt and system instruction. If the initial output passes the threshold ($s(y^{(0)}) \ge \tau$), it is returned immediately with **zero refinement iterations** ($Iter = 1.0$). If it fails ($s(y^{(0)}) < \tau$), control gates to downstream RL-driven refinement.
 
----
 
+
+
+![](phases.png)
+
+---
 ## 📊 Summary of Empirical Results
 
 Evaluated across **10 dialogue-oriented LLMs** (0.8B to 9B parameters) against 240 red-teaming prompts across 12 risk categories:
