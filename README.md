@@ -33,14 +33,14 @@ This repository implements a **hybrid safety framework** that cascades a Soft-Pr
 
 The framework operates via a **two-phase hybrid architecture**:
 
-![Hybrid Safeguarding Architecture Overview](architecture.png)
+![Hybrid Safeguarding Architecture Overview](Architecture.png)
 
 1. **Phase 1: Offline Soft Prompt Optimisation ($SP^2C$)**  
    A parameter-efficient soft prompt tensor $\theta_p$ is optimized over safe prompt-response pairs while base model weights remain frozen ($\nabla_{\theta_{\text{base}}} = 0$). Accepted trajectories feed back into multi-period adaptation rounds.
 2. **Phase 2: Gated Hybrid Inference Engine**  
    Each query is prepended with the soft prompt and system instruction. If the initial output passes the threshold ($s(y^{(0)}) \ge \tau$), it is returned immediately with **zero refinement iterations** ($Iter = 1.0$). If it fails ($s(y^{(0)}) < \tau$), control gates to downstream RL-driven refinement.
 
-![Four-Stage Sequential Adaptation Cycle](phases.png)
+![Four-Stage Sequential Adaptation Cycle](Phases.png)
 
 ---
 
