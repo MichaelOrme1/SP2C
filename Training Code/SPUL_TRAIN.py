@@ -120,26 +120,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 # )
 
 
-class SoftPromptBackpropTrainer:
-    """
-    Gradient-based soft prompt trainer.
- 
-    The core idea: treat the best (prompt, response) pairs as supervised
-    targets. Compute cross-entropy between the model's predicted token
-    distribution (conditioned on the soft prompt) and the actual target
-    tokens. Backprop the gradient into soft_prompt_tensor only.
- 
-    Args:
-        gen_model:          Your LocalGenerationModel instance.
-        soft_prompt_tensor: Starting point — either from EvolutionaryPromptOptimizer
-                            or freshly initialised. Will be cloned and detached.
-        learning_rate:      Adam LR. 0.01–0.05 works well for soft prompts.
-        weight_decay:       Keeps embeddings near the original manifold.
-        patience:           Early stopping — epochs without improvement.
-        max_target_tokens:  Truncate long responses to keep memory usage bounded.
-        log_csv_path:       Optional path to write per-step training logs.
-    """
- 
+class SoftPromptBackpropTrainer(SoftPromptBackpropTrainer):  # noqa: F821
     def __init__(
         self,
         gen_model,
@@ -149,286 +130,120 @@ class SoftPromptBackpropTrainer:
         patience: int = 8,
         max_target_tokens: int = 128,
         log_csv_path: str = None,
+        system_prefix: str = None,
+        clip_norm: float = 1.0,
     ):
-        self.gen_model = gen_model
-        self.device = gen_model.device
-        self.max_target_tokens = max_target_tokens
-        self.log_csv_path = log_csv_path
- 
-        # Clone and detach — we own this tensor, ES owns its own copy
-        self.soft_prompt = soft_prompt_tensor.detach().clone().to(self.device)
-        self.soft_prompt.requires_grad_(True)
- 
-        # Adam with weight decay — much more stable than vanilla SGD for embeddings
-        self.optimizer = torch.optim.AdamW(
-            [self.soft_prompt],
-            lr=learning_rate,
+        super().__init__(
+            gen_model=gen_model,
+            soft_prompt_tensor=soft_prompt_tensor,
+            learning_rate=learning_rate,
             weight_decay=weight_decay,
+            patience=patience,
+            max_target_tokens=max_target_tokens,
+            log_csv_path=log_csv_path,
         )
- 
-        # Early stopping state
-        self.patience = patience
-        self.best_loss = float("inf")
-        self.wait = 0
-        self.stop_training = False
- 
-        # Best prompt saved separately so early stopping doesn't lose it
+        self.system_prefix = system_prefix
+        self.clip_norm = clip_norm  # None disables clipping
+
+        # (1) Freeze the base model.
+        for p in self.gen_model.model.parameters():
+            p.requires_grad_(False)
+        self.gen_model.model.eval()
+
+        # (2) fp32 master copy of the soft prompt; optimiser rebuilt around it.
+        self.model_dtype = self.gen_model.embedding_layer.weight.dtype
+        self.soft_prompt = (
+            self.soft_prompt.detach().to(self.device, dtype=torch.float32).requires_grad_(True)
+        )
+        self.optimizer = torch.optim.AdamW(
+            [self.soft_prompt], lr=learning_rate, weight_decay=weight_decay
+        )
         self.best_soft_prompt = self.soft_prompt.detach().clone()
- 
-        if log_csv_path:
-            with open(log_csv_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(
-                    f, fieldnames=["category", "epoch", "step", "prompt_snippet", "loss"]
-                )
-                writer.writeheader()
- 
+
     # ------------------------------------------------------------------
-    # Public API
+    # Tokenisation
     # ------------------------------------------------------------------
- 
-    def train(
-        self,
-        csv_path: str,
-        category: str = None,
-        num_epochs: int = 20,
-        batch_size: int = 4,
-    ) -> torch.Tensor:
-        """
-        Train the soft prompt on pairs from csv_path.
- 
-        Args:
-            csv_path:   Path to best_splits.csv (columns: category, initial_prompt,
-                        generated_response).
-            category:   If set, only use rows matching this category (e.g. "S5").
-                        If None, use all rows.
-            num_epochs: Training epochs.
-            batch_size: Prompts per gradient step.
- 
-        Returns:
-            The best soft prompt tensor found during training.
-        """
-        pairs = self._load_pairs(csv_path, category)
-        if not pairs:
-            logger.warning(f"No pairs found for category={category} in {csv_path}")
-            return self.best_soft_prompt
- 
-        cat_label = category or "ALL"
-        logger.info(
-            f"Starting backprop training | category={cat_label} | "
-            f"pairs={len(pairs)} | epochs={num_epochs} | batch={batch_size}"
-        )
- 
-        for epoch in range(num_epochs):
-            if self.stop_training:
-                logger.info(f"Early stopping at epoch {epoch}")
-                break
- 
-            epoch_losses = []
-            # Shuffle pairs each epoch for better generalisation
-            indices = torch.randperm(len(pairs)).tolist()
-            batches = [
-                [pairs[i] for i in indices[s : s + batch_size]]
-                for s in range(0, len(indices), batch_size)
-            ]
- 
-            for step, batch in enumerate(batches):
-                loss = self._gradient_step(batch)
-                epoch_losses.append(loss)
- 
-                if self.log_csv_path:
-                    self._log_step(cat_label, epoch, step, batch[0][0], loss)
- 
-            avg_loss = sum(epoch_losses) / len(epoch_losses)
-            logger.info(f"Epoch {epoch:03d} | avg loss: {avg_loss:.4f}")
- 
-            self._early_stopping_check(avg_loss)
- 
-        logger.info(f"Training complete. Best loss: {self.best_loss:.4f}")
-        return self.best_soft_prompt
- 
-    def train_all_categories(
-        self,
-        csv_path: str,
-        save_dir: str,
-        num_epochs: int = 20,
-        batch_size: int = 4,
-        reinit_between_categories: bool = True,
-    ) -> dict:
-        """
-        Train a separate soft prompt for every category in the CSV,
-        mirroring the loop structure of run_categorical_unlearning_batches.
- 
-        Args:
-            csv_path:                   Path to best_splits.csv.
-            save_dir:                   Directory to save per-category .pt files.
-            reinit_between_categories:  If True, reset soft prompt and optimiser
-                                        state between categories (recommended).
- 
-        Returns:
-            Dict mapping category -> best soft prompt tensor.
-        """
-        os.makedirs(save_dir, exist_ok=True)
-        df = pd.read_csv(csv_path)
-        categories = sorted(df["category"].dropna().unique())
-        results = {}
- 
-        for cat in categories:
-            logger.info(f"\n{'='*60}\nTraining category: {cat}\n{'='*60}")
- 
-            if reinit_between_categories:
-                # Reset to the same starting tensor so each category starts fresh
-                self.soft_prompt = self.best_soft_prompt.detach().clone().to(self.device)
-                self.soft_prompt.requires_grad_(True)
-                self.optimizer = torch.optim.AdamW(
-                    [self.soft_prompt],
-                    lr=self.optimizer.param_groups[0]["lr"],
-                    weight_decay=self.optimizer.param_groups[0]["weight_decay"],
-                )
-                self.best_loss = float("inf")
-                self.wait = 0
-                self.stop_training = False
- 
-            best = self.train(csv_path, category=cat, num_epochs=num_epochs, batch_size=batch_size)
-            results[cat] = best
- 
-            save_path = os.path.join(save_dir, f"soft_prompt_bp_{cat}.pt")
-            torch.save(best, save_path)
-            logger.info(f"Saved {cat} soft prompt to {save_path}")
- 
-        return results
- 
+
+    def _encode_target(self, target_response: str) -> list:
+        """Target ids with no BOS, truncated to max_target_tokens, EOS appended if complete."""
+        tok = self.gen_model.tokenizer
+        ids = tok(target_response, add_special_tokens=False).input_ids
+        truncated = len(ids) > self.max_target_tokens
+        ids = ids[: self.max_target_tokens]
+        if not truncated and tok.eos_token_id is not None:
+            ids = ids + [tok.eos_token_id]
+        return ids
+
     # ------------------------------------------------------------------
-    # Core gradient step
+    # Loss (summed NLL for one sample; pooling happens in _gradient_step)
     # ------------------------------------------------------------------
- 
-    def _gradient_step(self, batch: list) -> float:
+
+    def _compute_loss(self, prompt: str, target_ids: list):
         """
-        One AdamW step over a batch of (prompt, target_response) pairs.
-        Returns the mean loss for this batch.
-        """
-        self.optimizer.zero_grad()
-        total_loss = torch.tensor(0.0, device=self.device)
-        valid_count = 0
- 
-        for prompt, target_response in batch:
-            loss = self._compute_loss(prompt, target_response)
-            if loss is not None:
-                total_loss = total_loss + loss
-                valid_count += 1
- 
-        if valid_count == 0:
-            return 0.0
- 
-        mean_loss = total_loss / valid_count
-        mean_loss.backward()
- 
-        # Gradient clipping — prevents embedding explosions
-        torch.nn.utils.clip_grad_norm_([self.soft_prompt], max_norm=1.0)
-        self.optimizer.step()
- 
-        return mean_loss.item()
- 
-    def _compute_loss(self, prompt: str, target_response: str) -> torch.Tensor | None:
-        """
-        Cross-entropy loss between the model's output distribution
-        (conditioned on soft prompt + user prompt) and the target tokens.
- 
-        The model is fully frozen — only gradients w.r.t. soft_prompt flow.
+        Returns the SUM of token NLLs for one (prompt, target) pair, or None on failure.
+        Input layout: [soft | (system_prefix) | user | target]; loss on target tokens only.
         """
         try:
-            tokenizer = self.gen_model.tokenizer
+            tok = self.gen_model.tokenizer
             model = self.gen_model.model
-            embedding_layer = self.gen_model.embedding_layer
- 
-            # --- 1. Tokenise target response (labels) ---
-            target_enc = tokenizer(
-                target_response,
-                return_tensors="pt",
-                truncation=True,
-                max_length=self.max_target_tokens,
-            ).to(self.device)
-            target_ids = target_enc.input_ids  # (1, T_target)
- 
-            # --- 2. Build input embeddings: [soft_prompt | user_prompt] ---
-            user_enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=256).to(self.device)
-            user_embeds = embedding_layer(user_enc.input_ids)  # (1, T_user, D)
- 
-            # soft_prompt shape: (1, num_soft_tokens, D)
-            sp = self.soft_prompt
-            if sp.shape[0] != user_embeds.shape[0]:
-                sp = sp.expand(user_embeds.shape[0], -1, -1)
- 
-            input_embeds = torch.cat([sp, user_embeds], dim=1)  # (1, T_soft+T_user, D)
- 
-            # --- 3. Build target embeddings for decoder input ---
-            target_embeds = embedding_layer(target_ids)  # (1, T_target, D)
- 
-            # Full sequence the model sees: [soft | user | target]
-            # We compute loss only on the target portion
-            full_embeds = torch.cat([input_embeds, target_embeds], dim=1)
-            seq_len = full_embeds.shape[1]
-            attention_mask = torch.ones((1, seq_len), device=self.device)
- 
-            # --- 4. Forward pass (model weights frozen via torch.no_grad on params) ---
-            # We use inference_mode=False so autograd tracks soft_prompt gradients,
-            # but the model's own parameters don't accumulate gradients.
-            with torch.set_grad_enabled(True):
-                outputs = model(
-                    inputs_embeds=full_embeds,
-                    attention_mask=attention_mask,
-                )
- 
-            logits = outputs.logits  # (1, seq_len, vocab_size)
- 
-            # --- 5. Shift so we predict target tokens ---
-            # Input positions for target: from (T_soft + T_user) to (seq_len - 1)
-            # Label positions: from (T_soft + T_user + 1) to seq_len
-            prefix_len = input_embeds.shape[1]
-            # Logits at positions [prefix_len-1 .. seq_len-2] predict target tokens
-            pred_logits = logits[:, prefix_len - 1 : seq_len - 1, :]  # (1, T_target, vocab)
-            pred_logits = pred_logits.reshape(-1, pred_logits.shape[-1])  # (T_target, vocab)
-            labels = target_ids.reshape(-1)  # (T_target,)
- 
-            loss = F.cross_entropy(pred_logits, labels, ignore_index=tokenizer.pad_token_id)
-            return loss
- 
+            emb = self.gen_model.embedding_layer
+
+            text = f"{self.system_prefix}\n{prompt}" if self.system_prefix else prompt
+            user_ids = tok(text, return_tensors="pt", truncation=True, max_length=256).input_ids.to(self.device)
+            tgt = torch.tensor([target_ids], device=self.device)
+
+            with torch.no_grad():  # embedding table is frozen; no graph needed for these
+                user_embeds = emb(user_ids)
+                tgt_embeds = emb(tgt)
+
+            sp = self.soft_prompt.to(user_embeds.dtype)  # differentiable cast from fp32 master
+            if sp.dim() == 2:
+                sp = sp.unsqueeze(0)
+
+            full = torch.cat([sp, user_embeds, tgt_embeds], dim=1)
+            prefix_len = sp.shape[1] + user_embeds.shape[1]
+            attn = torch.ones(full.shape[:2], dtype=torch.long, device=self.device)
+
+            logits = model(inputs_embeds=full, attention_mask=attn).logits
+            pred = logits[:, prefix_len - 1 : full.shape[1] - 1, :].reshape(-1, logits.shape[-1])
+            return F.cross_entropy(pred.float(), tgt.reshape(-1), reduction="sum")
         except Exception as e:
-            logger.warning(f"Loss computation failed for prompt '{prompt[:40]}...': {e}")
+            logger.warning(f"Loss computation failed for prompt '{prompt[:40]}...': {e}")  # noqa: F821
             return None
- 
+
     # ------------------------------------------------------------------
-    # Helpers
+    # One optimiser step over a batch
     # ------------------------------------------------------------------
- 
-    def _load_pairs(self, csv_path: str, category: str = None) -> list:
-        df = pd.read_csv(csv_path)
-        if category:
-            df = df[df["category"] == category]
-        df = df.dropna(subset=["initial_prompt", "generated_response"])
-        return list(zip(df["initial_prompt"], df["generated_response"]))
- 
-    def _early_stopping_check(self, avg_loss: float):
-        if avg_loss < self.best_loss - 1e-4:
-            self.best_loss = avg_loss
-            self.wait = 0
-            self.best_soft_prompt = self.soft_prompt.detach().clone()
+
+    def _gradient_step(self, batch: list) -> float:
+        self.optimizer.zero_grad(set_to_none=True)
+        total_nll, total_tokens = 0.0, 0
+
+        for prompt, response in batch:
+            target_ids = self._encode_target(response)
+            if not target_ids:
+                continue
+            nll_sum = self._compute_loss(prompt, target_ids)
+            if nll_sum is None or not torch.isfinite(nll_sum):
+                continue
+            nll_sum.backward()  # accumulate unnormalised grads; one graph alive at a time
+            total_nll += nll_sum.item()
+            total_tokens += len(target_ids)
+
+        if total_tokens == 0 or self.soft_prompt.grad is None:
+            return 0.0
+
+        self.soft_prompt.grad.div_(total_tokens)  # pooled mean over all target tokens
+        if self.clip_norm is not None:
+            grad_norm = torch.nn.utils.clip_grad_norm_([self.soft_prompt], max_norm=self.clip_norm)
         else:
-            self.wait += 1
-            if self.wait >= self.patience:
-                self.stop_training = True
- 
-    def _log_step(self, category, epoch, step, prompt, loss):
-        with open(self.log_csv_path, "a", newline="", encoding="utf-8") as f:
-            csv.DictWriter(
-                f,
-                fieldnames=["category", "epoch", "step", "prompt_snippet", "loss"],
-            ).writerow({
-                "category": category,
-                "epoch": epoch,
-                "step": step,
-                "prompt_snippet": prompt[:60],
-                "loss": f"{loss:.4f}",
-            })
+            grad_norm = self.soft_prompt.grad.norm()
+        if not torch.isfinite(grad_norm):
+            logger.warning("Non-finite gradient norm; skipping step.")  # noqa: F821
+            self.optimizer.zero_grad(set_to_none=True)
+            return total_nll / total_tokens
+        self.optimizer.step()
+        return total_nll / total_tokens
 # ---------------------------------------------------------------------------
 # EMOTION MODEL - Trained RoBERTa classifier (Positive / Neutral / Negative).
 # Loads the prompt+response model from OUTPUT_DIR_COMBINED.
